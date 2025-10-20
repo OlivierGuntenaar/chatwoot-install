@@ -531,19 +531,48 @@ function setup_ssl() {
     echo "debug: domain: $domain_name"
     echo "debug: letsencrypt email: $le_email"
   fi
-  curl https://ssl-config.mozilla.org/ffdhe4096.txt >> /etc/ssl/dhparam
-  wget https://raw.githubusercontent.com/chatwoot/chatwoot/develop/deployment/nginx_chatwoot.conf
+
+  # DH params
+  curl -fsSL https://ssl-config.mozilla.org/ffdhe4096.txt >> /etc/ssl/dhparam
+
+  # Base nginx conf
+  wget -q https://raw.githubusercontent.com/chatwoot/chatwoot/develop/deployment/nginx_chatwoot.conf
   cp nginx_chatwoot.conf /etc/nginx/sites-available/nginx_chatwoot.conf
+
+  # Issue certs BEFORE changing ports (ACME HTTP-01 needs :80)
   certbot certonly --non-interactive --agree-tos --nginx -m "$le_email" -d "$domain_name"
+
+  # Inject domain
   sed -i "s/chatwoot.domain.com/$domain_name/g" /etc/nginx/sites-available/nginx_chatwoot.conf
-  ln -s /etc/nginx/sites-available/nginx_chatwoot.conf /etc/nginx/sites-enabled/nginx_chatwoot.conf
-  systemctl restart nginx
+
+  # Change listen ports: 80->81, 443->4443 (IPv4/IPv6; with/without reuseport)
+  sed -i 's/listen 80;/listen 81;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
+  sed -i 's/listen \[::\]:80;/listen [::]:81;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
+  sed -i 's/listen 443 ssl http2 reuseport;/listen 4443 ssl http2 reuseport;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
+  sed -i 's/listen 443 ssl http2;/listen 4443 ssl http2;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
+  sed -i 's/listen \[::\]:443 ssl http2 reuseport;/listen [::]:4443 ssl http2 reuseport;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
+  sed -i 's/listen \[::\]:443 ssl http2;/listen [::]:4443 ssl http2;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
+
+  # Fix HTTP->HTTPS redirect to include :4443
+  # Original line becomes: return 301 https://$domain_name$request_uri;
+  # We transform it to:     return 301 https://$domain_name:4443$request_uri;
+  sed -i "s|return 301 https://$domain_name\\\$request_uri;|return 301 https://$domain_name:4443\\\$request_uri;|g" /etc/nginx/sites-available/nginx_chatwoot.conf
+  sed -i "s|return 301 https://www\\.$domain_name\\\$request_uri;|return 301 https://www\\.$domain_name:4443\\\$request_uri;|g" /etc/nginx/sites-available/nginx_chatwoot.conf
+
+  # Enable site and reload nginx
+  ln -sf /etc/nginx/sites-available/nginx_chatwoot.conf /etc/nginx/sites-enabled/nginx_chatwoot.conf
+  nginx -t && systemctl reload nginx || systemctl restart nginx
+
+  # Update FRONTEND_URL to include :4443
   sudo -i -u chatwoot << EOF
   cd chatwoot
-  sed -i "s/http:\/\/0.0.0.0:3000/https:\/\/$domain_name/g" .env
+  # Replace default dev URL
+  sed -i "s|http://0.0.0.0:3000|https://$domain_name:4443|g" .env
+  # If a plain https://$domain_name exists, add :4443
+  sed -i "s|https://$domain_name\\b|https://$domain_name:4443|g" .env
 EOF
 
-  # Restart the appropriate chatwoot target
+  # Restart Chatwoot
   if [ -f "/etc/systemd/system/chatwoot-web.target" ]; then
     systemctl restart chatwoot-web.target
   elif [ -f "/etc/systemd/system/chatwoot-worker.target" ]; then
@@ -551,6 +580,8 @@ EOF
   else
     systemctl restart chatwoot.target
   fi
+
+  echo "Nginx now listens on HTTP :81 and HTTPS :4443. Access: https://$domain_name:4443"
 }
 
 ##############################################################################
