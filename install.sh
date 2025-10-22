@@ -17,8 +17,8 @@ fi
 
 # Global variables
 # option --output/-o requires 1 argument
-LONGOPTS=console,debug,help,install,Install:,logs:,restart,ssl,upgrade,Upgrade:,webserver,version,web-only,worker-only,convert:
-OPTIONS=cdhiI:l:rsuU:wvWK
+LONGOPTS=console,debug,help,install,Install:,logs:,restart,upgrade,Upgrade:,version,web-only,worker-only,convert:,domain:
+OPTIONS=cdhiI:l:ruU:vWKD:
 CWCTL_VERSION="3.4.3"
 pg_pass=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 15 ; echo '')
 CHATWOOT_HUB_URL="https://hub.2.chatwoot.com/events"
@@ -42,7 +42,7 @@ fi
 # read getopt’s output this way to handle the quoting right:
 eval set -- "$PARSED"
 
-c=n d=n h=n i=n I=n l=n r=n s=n u=n U=n w=n v=n W=n K=n C=n BRANCH=master SERVICE=web DEPLOYMENT_TYPE=full CONVERT_TO=""
+c=n d=n h=n i=n I=n l=n r=n u=n U=n v=n W=n K=n C=n BRANCH=master SERVICE=web DEPLOYMENT_TYPE=full CONVERT_TO="" DOMAIN=""
 # Iterate options in order and nicely split until we see --
 while true; do
     case "$1" in
@@ -77,10 +77,7 @@ while true; do
             r=y
             break
             ;;
-        -s|--ssl)
-            s=y
-            shift
-            ;;
+        
         -u|--upgrade)
             u=y
             BRANCH="master"
@@ -91,10 +88,7 @@ while true; do
             BRANCH="$2"
             break
             ;;
-        -w|--webserver)
-            w=y
-            shift
-            ;;
+        
         -v|--version)
             v=y
             shift
@@ -129,6 +123,10 @@ while true; do
             esac
             shift 2
             ;;
+        -D|--domain)
+            DOMAIN="$2"
+            shift 2
+            ;;
         --)
             shift
             break
@@ -143,7 +141,7 @@ done
 # log if debug flag set
 if [ "$d" == "y" ]; then
   echo "console: $c, debug: $d, help: $h, install: $i, Install: $I, BRANCH: $BRANCH, \
-  logs: $l, SERVICE: $SERVICE, ssl: $s, upgrade: $u, Upgrade: $U, webserver: $w, web-only: $W, worker-only: $K, convert: $C, convert-to: $CONVERT_TO, deployment-type: $DEPLOYMENT_TYPE"
+  logs: $l, SERVICE: $SERVICE, upgrade: $u, Upgrade: $U, web-only: $W, worker-only: $K, convert: $C, convert-to: $CONVERT_TO, domain: $DOMAIN, deployment-type: $DEPLOYMENT_TYPE"
 fi
 
 # exit if script is not run as root
@@ -398,6 +396,13 @@ function setup_chatwoot() {
 
   rake assets:precompile RAILS_ENV=production NODE_OPTIONS="--max-old-space-size=4096 --openssl-legacy-provider"
 EOF
+  # If a domain was provided, set FRONTEND_URL now (for external reverse proxy)
+  if [ -n "$DOMAIN" ]; then
+    sudo -i -u chatwoot << EOF
+    cd chatwoot
+    sed -i -e "s|^#\?FRONTEND_URL=.*|FRONTEND_URL=https://$DOMAIN|" .env
+EOF
+  fi
 }
 
 ##############################################################################
@@ -526,62 +531,7 @@ function configure_systemd_services() {
 #   None
 ##############################################################################
 function setup_ssl() {
-  if [ "$d" == "y" ]; then
-    echo "debug: setting up ssl"
-    echo "debug: domain: $domain_name"
-    echo "debug: letsencrypt email: $le_email"
-  fi
-
-  # DH params
-  curl -fsSL https://ssl-config.mozilla.org/ffdhe4096.txt >> /etc/ssl/dhparam
-
-  # Base nginx conf
-  wget -q https://raw.githubusercontent.com/chatwoot/chatwoot/develop/deployment/nginx_chatwoot.conf
-  cp nginx_chatwoot.conf /etc/nginx/sites-available/nginx_chatwoot.conf
-
-  # Issue certs BEFORE changing ports (ACME HTTP-01 needs :80)
-  certbot certonly --non-interactive --agree-tos --nginx -m "$le_email" -d "$domain_name"
-
-  # Inject domain
-  sed -i "s/chatwoot.domain.com/$domain_name/g" /etc/nginx/sites-available/nginx_chatwoot.conf
-
-  # Change listen ports: 80->81, 443->4443 (IPv4/IPv6; with/without reuseport)
-  sed -i 's/listen 80;/listen 81;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
-  sed -i 's/listen \[::\]:80;/listen [::]:81;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
-  sed -i 's/listen 443 ssl http2 reuseport;/listen 4443 ssl http2 reuseport;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
-  sed -i 's/listen 443 ssl http2;/listen 4443 ssl http2;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
-  sed -i 's/listen \[::\]:443 ssl http2 reuseport;/listen [::]:4443 ssl http2 reuseport;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
-  sed -i 's/listen \[::\]:443 ssl http2;/listen [::]:4443 ssl http2;/g' /etc/nginx/sites-available/nginx_chatwoot.conf
-
-  # Fix HTTP->HTTPS redirect to include :4443
-  # Original line becomes: return 301 https://$domain_name$request_uri;
-  # We transform it to:     return 301 https://$domain_name:4443$request_uri;
-  sed -i "s|return 301 https://$domain_name\\\$request_uri;|return 301 https://$domain_name:4443\\\$request_uri;|g" /etc/nginx/sites-available/nginx_chatwoot.conf
-  sed -i "s|return 301 https://www\\.$domain_name\\\$request_uri;|return 301 https://www\\.$domain_name:4443\\\$request_uri;|g" /etc/nginx/sites-available/nginx_chatwoot.conf
-
-  # Enable site and reload nginx
-  ln -sf /etc/nginx/sites-available/nginx_chatwoot.conf /etc/nginx/sites-enabled/nginx_chatwoot.conf
-  nginx -t && systemctl reload nginx || systemctl restart nginx
-
-  # Update FRONTEND_URL to include :4443
-  sudo -i -u chatwoot << EOF
-  cd chatwoot
-  # Replace default dev URL
-  sed -i "s|http://0.0.0.0:3000|https://$domain_name:4443|g" .env
-  # If a plain https://$domain_name exists, add :4443
-  sed -i "s|https://$domain_name\\b|https://$domain_name:4443|g" .env
-EOF
-
-  # Restart Chatwoot
-  if [ -f "/etc/systemd/system/chatwoot-web.target" ]; then
-    systemctl restart chatwoot-web.target
-  elif [ -f "/etc/systemd/system/chatwoot-worker.target" ]; then
-    systemctl restart chatwoot-worker.target
-  else
-    systemctl restart chatwoot.target
-  fi
-
-  echo "Nginx now listens on HTTP :81 and HTTPS :4443. Access: https://$domain_name:4443"
+  echo "SSL/Nginx setup is disabled in this build. Use your external reverse proxy (e.g., Traefik) and set FRONTEND_URL in .env."
 }
 
 ##############################################################################
@@ -654,11 +604,6 @@ For more verbose logs, open up a second terminal and follow along using,
 EOF
 
   sleep 3
-  read -rp 'Would you like to configure a domain and SSL for Chatwoot?(yes or no): ' configure_webserver
-
-  if [ "$configure_webserver" == "yes" ]; then
-    get_domain_info
-  fi
 
   echo -en "\n"
   read -rp 'Would you like to install Postgres and Redis? (Answer no if you plan to use external services)(yes or no): ' install_pg_redis
@@ -673,12 +618,7 @@ EOF
     echo "➥ 2/9 Skipping Postgres and Redis installation."
   fi
 
-  if [ "$configure_webserver" == "yes" ]; then
-    echo "➥ 3/9 Installing webserver."
-    install_webserver &>> "${LOG_FILE}"
-  else
-    echo "➥ 3/9 Skipping webserver installation."
-  fi
+  echo "➥ 3/9 Skipping webserver installation (not used)."
 
   echo "➥ 4/9 Setting up Ruby"
   configure_rvm &>> "${LOG_FILE}"
@@ -693,6 +633,14 @@ EOF
   echo "➥ 6/9 Installing Chatwoot. This takes a long while."
   setup_chatwoot &>> "${LOG_FILE}"
 
+  # If a domain was provided, set FRONTEND_URL now (for external reverse proxy)
+  if [ -n "$DOMAIN" ]; then
+    sudo -i -u chatwoot << EOF
+    cd chatwoot
+    sed -i -e "s|^#\?FRONTEND_URL=.*|FRONTEND_URL=https://$DOMAIN|" .env
+EOF
+  fi
+
   if [ "$install_pg_redis" != "no" ]; then
     echo "➥ 7/9 Running database migrations."
     run_db_migrations &>> "${LOG_FILE}"
@@ -705,29 +653,20 @@ EOF
 
   public_ip=$(curl http://checkip.amazonaws.com -s)
 
-  if [ "$configure_webserver" != "yes" ]
-  then
-    cat << EOF
-➥ 9/9 Skipping SSL/TLS setup.
+  cat << EOF
+➥ 9/9 Skipping SSL/TLS setup (use an external reverse proxy like Traefik).
 
 ***************************************************************************
 Woot! Woot!! Chatwoot server installation is complete.
 The server will be accessible at http://$public_ip:3000
 
-To configure a domain and SSL certificate, follow the guide at
-https://www.chatwoot.com/docs/deployment/deploy-chatwoot-in-linux-vm?utm_source=cwctl
+Set FRONTEND_URL in .env (already set if you used --domain) and proxy HTTPS via your reverse proxy.
 
 Join the community at https://chatwoot.com/community?utm_source=cwctl
 ***************************************************************************
 
 EOF
   cwctl_message
-  else
-    echo "➥ 9/9 Setting up SSL/TLS."
-    setup_ssl &>> "${LOG_FILE}"
-    ssl_success_message
-    cwctl_message
-  fi
 
   if [ "$install_pg_redis" == "no" ]
   then
@@ -788,17 +727,17 @@ Example: cwctl -U develop        (upgrade to develop branch)
 Example: cwctl -l web
 Example: cwctl --logs worker
 Example: cwctl -c
+Example: cwctl -i --domain example.com  (set FRONTEND_URL; use external reverse proxy)
 
 Installation/Upgrade:
   -i, --install             Install the latest stable version of Chatwoot
   -I BRANCH                 Install Chatwoot from a git branch
   -u, --upgrade             Upgrade Chatwoot to the latest stable version
   -U BRANCH                 Upgrade Chatwoot from a git branch (EXPERIMENTAL)
-  -s, --ssl                 Fetch and install SSL certificates using LetsEncrypt
-  -w, --webserver           Install and configure Nginx webserver with SSL
   -W, --web-only            Install only the web server (for ASG deployment)
   -K, --worker-only         Install only the background worker (for ASG deployment)
       --convert TYPE        Convert existing deployment (TYPE: web, worker, full)
+  -D, --domain FQDN         Set FRONTEND_URL to https://FQDN (for external reverse proxy)
 
 Management:
   -c, --console             Open ruby console
@@ -835,29 +774,6 @@ function get_logs() {
   if [ "$SERVICE" == "web" ]; then
     journalctl -u chatwoot-web.1.service -f
   fi
-}
-
-##############################################################################
-# Setup SSL (-s/--ssl)
-# Installs nginx if not available.
-# Globals:
-#   domain_name
-#   le_email
-# Arguments:
-#   None
-# Outputs:
-#   None
-##############################################################################
-function ssl() {
-   if [ "$d" == "y" ]; then
-     echo "Setting up ssl"
-   fi
-   get_domain_info
-   if ! systemctl -q is-active nginx; then
-    install_webserver
-   fi
-   setup_ssl
-   ssl_success_message
 }
 
 ##############################################################################
@@ -1147,25 +1063,6 @@ function convert_deployment() {
 }
 
 ##############################################################################
-# Install nginx and setup SSL (-w/--webserver)
-# Globals:
-#   domain_name
-#   le_email
-# Arguments:
-#   None
-# Outputs:
-#   None
-##############################################################################
-function webserver() {
-  if [ "$d" == "y" ]; then
-     echo "Installing nginx"
-  fi
-  ssl
-  #TODO(@vn): allow installing nginx only without SSL
-}
-
-
-##############################################################################
 # Report cwctl events to hub
 # Globals:
 #   CHATWOOT_HUB_URL
@@ -1341,24 +1238,9 @@ function main() {
     restart
   fi
 
-  if [ "$s" == "y" ]; then
-    report_event "cwctl" "ssl"  > /dev/null 2>&1
-    ssl
-  fi
-
   if [ "$u" == "y" ] || [ "$U" == "y" ]; then
     report_event "cwctl" "upgrade"  > /dev/null 2>&1
     upgrade
-  fi
-
-  if [ "$w" == "y" ]; then
-    report_event "cwctl" "webserver"  > /dev/null 2>&1
-    webserver
-  fi
-
-  if [ "$v" == "y" ]; then
-    report_event "cwctl" "version"  > /dev/null 2>&1
-    version
   fi
 
   if [ "$C" == "y" ]; then
